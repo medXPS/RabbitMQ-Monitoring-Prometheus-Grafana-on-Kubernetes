@@ -67,8 +67,10 @@
 						<image>openjdk:17</image>
 					</from>
 					<to>
-						<image>rabbitmqmonitoring/consumer</image>
+						<image>registry.hub.docker.com/sk09devops/rabbitmqmonitoring/consumer</image>
 						<tags>${project.version}</tags>
+
+
 					</to>
 				</configuration>
 			</plugin>
