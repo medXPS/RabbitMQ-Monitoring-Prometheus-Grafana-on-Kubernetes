@@ -83,37 +83,297 @@ spec:
             name: rabbitmq
 </code></pre>
 
-<!-- Include the remaining steps (Step 3 to Step 7) similarly -->
-
 <h2>Step 3 – Building Spring Boot listener application</h2>
 
-<!-- Include the content for Step 3 here -->
+<p>Our sample listener application uses Spring Boot AMQP project for integration with RabbitMQ. Thanks to Spring Boot Actuator module it is also exposing metrics including RabbiMQ specific values. It is important to expose them in the format readable by Prometheus.</p>
+
+<pre><code>&lt;dependency&gt;
+   &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+   &lt;artifactId&gt;spring-boot-starter-amqp&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+   &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+   &lt;artifactId&gt;spring-boot-starter-actuator&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+   &lt;groupId&gt;io.micrometer&lt;/groupId&gt;
+   &lt;artifactId&gt;micrometer-registry-prometheus&lt;/artifactId&gt;
+&lt;/dependency&gt;
+</code></pre>
+
+<p>The listener application defines and creates two exchanges. First of them, trx-events-topic, is used for multicast communication. On the other hand, trx-events-direct takes a part in point-to-point communication. Both our sample applications are exchanging messages in JSON format. Therefore we have to override a default Spring Boot AMQP message converter with Jackson2JsonMessageConverter.</p>
+
+<pre><code>@SpringBootApplication
+public class ListenerApplication {
+
+   public static void main(String[] args) {
+      SpringApplication.run(ListenerApplication.class, args);
+   }
+
+   @Bean
+   public TopicExchange topic() {
+      return new TopicExchange("trx-events-topic");
+   }
+
+   @Bean
+   public DirectExchange queue() {
+      return new DirectExchange("trx-events-direct");
+   }
+
+   @Bean
+   public MessageConverter jsonMessageConverter() {
+      return new Jackson2JsonMessageConverter();
+   }
+}
+</code></pre>
+
+<p>The listener application receives messages from the both topic and direct exchanges. Each running instance of this application is creating a queue binding with the random name. With a direct exchange, only a single queue is receiving incoming messages. On the other hand, all the queues related to a topic exchange are receiving incoming messages.</p>
+
+<pre><code>@Component
+@Slf4j
+public class ListenerComponent {
+
+   @RabbitListener(bindings = {
+      @QueueBinding(
+         exchange = @Exchange(type = ExchangeTypes.TOPIC, name = "trx-events-topic"),
+         value = @Queue("${topic.queue.name}")
+      )
+   })
+   public void onTopicMessage(SampleMessage message) {
+      log.info("Message received: {}", message);
+   }
+
+   @RabbitListener(bindings = {
+      @QueueBinding(
+         exchange = @Exchange(type = ExchangeTypes.DIRECT, name = "trx-events-direct"),
+         value = @Queue("${direct.queue.name}")
+      )
+   })
+   public void onDirectMessage(SampleMessage message) {
+      log.info("Message received: {}", message);
+   }
+
+}
+</code></pre>
+
+<p>The name of queues assigned to the topic and direct exchanges is configured inside application.yml file.</p>
+
+<pre><code>topic.queue.name: t-${random.uuid}
+direct.queue.name: d-${random.uuid}
+</code></pre>
 
 <h2>Step 4 – Building Spring Boot producer application</h2>
 
-<!-- Include the content for Step 4 here -->
+<p>The producer application also uses Spring Boot AMQP for integration with RabbitMQ. It sends messages to the exchanges with RabbitTemplate. Similarly to the listener application it formats all the messages as JSON string.</p>
+
+<pre><code>@SpringBootApplication
+@EnableScheduling
+public class ProducerApplication {
+
+   public static void main(String[] args) {
+      SpringApplication.run(ProducerApplication.class, args);
+   }
+
+   @Bean
+   public RabbitTemplate rabbitTemplate(final ConnectionFactory connectionFactory) {
+      final RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
+      rabbitTemplate.setMessageConverter(producerJackson2MessageConverter());
+      return rabbitTemplate;
+   }
+
+   @Bean
+   public Jackson2JsonMessageConverter producerJackson2MessageConverter() {
+      return new Jackson2JsonMessageConverter();
+   }
+
+}
+</code></pre>
+
+<p>The producer application starts sending messages just after startup. Each message contains id, type and message fields. They are sent to the topic exchange with 5 seconds interval, and to the direct exchange with 2 seconds interval.</p>
+
+<pre><code>@Component
+@Slf4j
+public class ProducerComponent {
+
+   int index = 1;
+   private RabbitTemplate rabbitTemplate;
+
+   ProducerComponent(RabbitTemplate rabbitTemplate) {
+      this.rabbitTemplate = rabbitTemplate;
+   }
+
+   @Scheduled(fixedRate = 5000)
+   public void sendToTopic() {
+      SampleMessage msg = new SampleMessage(index++, "abc", "topic");
+      rabbitTemplate.convertAndSend("trx-events-topic", null, msg);
+      log.info("Sending message: {}", msg);
+   }
+
+   @Scheduled(fixedRate = 2000)
+   public void sendToDirect() {
+      SampleMessage msg = new SampleMessage(index++, "abc", "direct");
+      rabbitTemplate.convertAndSend("trx-events-direct", null, msg);
+      log.info("Sending message: {}", msg);
+   }
+   
+}
+</code></pre>
 
 <h2>Step 5 – Deploying Prometheus and Grafana for RabbitMQ monitoring</h2>
 
-<!-- Include the content for Step 5 here -->
+<p>We will use Prometheus for collecting metrics from RabbitMQ, and our both Spring Boot applications. Prometheus detects endpoints with metrics by the Kubernetes Service app label and a HTTP port name. Of course, you can define different search criteria for that. Because Spring Boot and RabbitMQ metrics are defined under different endpoints, we need to define two jobs. On the source code below you can see the ConfigMap that contains the Prometheus configuration file.</p>
+
+<pre><code>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  labels:
+    name: prometheus
+data:
+  prometheus.yml: |-
+    scrape_configs:
+      - job_name: 'springboot'
+        metrics_path: /actuator/prometheus
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+        - role: endpoints
+          namespaces:
+            names:
+              - default
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app]
+            separator: ;
+            regex: (producer|listener)
+            replacement: $1
+            action: keep
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            separator: ;
+            regex: http
+            replacement: $1
+            action: keep
+          # ...
+      - job_name: 'rabbitmq'
+        metrics_path: /metrics
+        scrape_interval: 5s
+        kubernetes_sd_configs:
+        - role: endpoints
+          namespaces:
+            names:
+              - default
+
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_label_app]
+            separator: ;
+            regex: rabbitmq
+            replacement: $1
+            action: keep
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            separator: ;
+            regex: prometheus
+            replacement: $1
+            action: keep
+          # ...
+</code></pre>
+
+<p>For the full version of Prometheus deployment please refer to the source code. Prometheus tries to discover metric endpoints by the Kubernetes Service label and port name. Let’s take a look on the Service for the listener application.</p>
+
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: listener-service
+  labels:
+    app: listener
+spec:
+  type: ClusterIP
+  selector:
+    app: listener
+  ports:
+  - port: 8080
+    name: http
+</code></pre>
+
+<p>Similarly, we should create Service for RabbitMQ.</p>
+
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-service
+  labels:
+    app: rabbitmq
+spec:
+  type: NodePort
+  selector:
+    app: rabbitmq
+  ports:
+  - port: 15672
+    name: http
+  - port: 5672
+    name: amqp
+  - port: 15692
+    name: prometheus
+</code></pre>
 
 <h2>Step 6 – Deploying stack for RabbitMQ monitoring</h2>
 
-<!-- Include the content for Step 6 here -->
+<p>We can finally proceed to the deployment on Kubernetes. In summary, we have five running applications. Three of them, RabbitMQ with the management console, Prometheus, and Grafana are a part of the RabbitMQ monitoring stack. We also have a single instance of the Spring Boot AMQP producer application, and two instances of the Spring Boot AMQP listener application. You can see the final list of pods in the picture below.</p>
+
+<p>If you deploy Spring Boot applications with skaffold dev --port-forward command, you can easily access them on the local port. Other applications can be accessed via Kubernetes Service NodePort.</p>
 
 <h2>Step 7 – RabbitMQ monitoring with Prometheus metrics</h2>
 
-<!-- Include the content for Step 7 here -->
+<p>We can easily verify a list of metrics generated by Spring Boot applications by calling /actuator/prometheus endpoint. First, let’s take a look at the metrics returned by the listener application.</p>
 
-<h2>Conclusion</h2>
+<pre><code>rabbitmq_not_acknowledged_published_total{name="rabbit",} 0.0
+rabbitmq_unrouted_published_total{name="rabbit",} 0.0
+rabbitmq_channels{name="rabbit",} 2.0
+rabbitmq_consumed_total{name="rabbit",} 2432.0
+rabbitmq_connections{name="rabbit",} 1.0
+rabbitmq_acknowledged_total{name="rabbit",} 2432.0
+spring_rabbitmq_listener_seconds_max{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#1",queue="d-ea28bd07-929d-4928-8d2c-5dceeec9950a",result="success",} 0.0025406
+spring_rabbitmq_listener_seconds_max{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#0",queue="t-e8990fe4-7d8c-4a2c-96d7-fff4fe503265",result="success",} 0.0024175
+spring_rabbitmq_listener_seconds_count{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#1",queue="d-ea28bd07-929d-4928-8d2c-5dceeec9950a",result="success",} 1712.0
+spring_rabbitmq_listener_seconds_sum{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#1",queue="d-ea28bd07-929d-4928-8d2c-5dceeec9950a",result="success",} 0.992886413
+spring_rabbitmq_listener_seconds_count{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#0",queue="t-e8990fe4-7d8c-4a2c-96d7-fff4fe503265",result="success",} 720.0
+spring_rabbitmq_listener_seconds_sum{exception="none",listener_id="org.springframework.amqp.rabbit.RabbitListenerEndpointContainer#0",queue="t-e8990fe4-7d8c-4a2c-96d7-fff4fe503265",result="success",} 0.598468801
+rabbitmq_acknowledged_published_total{name="rabbit",} 0.0
+rabbitmq_failed_to_publish_total{name="rabbit",} 0.0
+rabbitmq_rejected_total{name="rabbit",} 0.0
+rabbitmq_published_total{name="rabbit",} 0.0
+</code></pre>
 
-<p>This guide provides a comprehensive walkthrough of setting up RabbitMQ monitoring on Kubernetes. By following these steps, you'll be able to monitor RabbitMQ, Spring Boot applications, and Prometheus metrics effectively.</p>
+<p>Similarly, we can verify the list of metrics from the producer application. In contrast to the listener application, it is generating rabbitmq_published_total instead of rabbitmq_consumed_total.</p>
 
-<p>For detailed configurations and additional details, please refer to the source code and documentation.</p>
+<pre><code>rabbitmq_acknowledged_published_total{name="rabbit",} 0.0
+rabbitmq_unrouted_published_total{name="rabbit",} 0.0
+rabbitmq_acknowledged_total{name="rabbit",} 0.0
+rabbitmq_rejected_total{name="rabbit",} 0.0
+rabbitmq_connections{name="rabbit",} 1.0
+rabbitmq_not_acknowledged_published_total{name="rabbit",} 0.0
+rabbitmq_consumed_total{name="rabbit",} 0.0
+rabbitmq_failed_to_publish_total{name="rabbit",} 0.0
+rabbitmq_published_total{name="rabbit",} 2553.0
+rabbitmq_channels{name="rabbit",} 1.0
+</code></pre>
 
-<h2>License</h2>
+<p>The list of metrics generated by the RabbitMQ Prometheus plugin is pretty impressive. I decided to use only some of them.</p>
 
-<p>This project is licensed under the MIT License - see the <a href="LICENSE">LICENSE</a> file for details.</p>
+<pre><code>rabbitmq_channel_consumers 6
+rabbitmq_channel_messages_published_total 2926
+rabbitmq_channel_messages_delivered_total 2022
+rabbitmq_channel_messages_acked_total 5922
+rabbitmq_connections_opened_total 9
+rabbitmq_connection_incoming_bytes_total 700878
+rabbitmq_connection_outgoing_bytes_total 1388158
+rabbitmq_connection_channels 5
+rabbitmq_queue_messages 5917
+rabbitmq_queue_consumers 6
+rabbitmq_queues 10
+</code></pre>
+
+<p>We can visualize all the metrics on the Grafana dashboard. Grafana is using Prometheus as a data source. To repeat, Prometheus collects data from the Spring Boot applications endpoints and RabbitMQ.</p>
+
+<p>but indicate only file name instead of its code</p>
 
 </body>
 </html>
